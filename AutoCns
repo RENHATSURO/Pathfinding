@@ -46,6 +46,8 @@ local stats = {
 local currentTargetPart: BasePart? = nil
 local pathBlockedConsecutive = 0
 local lastSecuTPAt = 0
+local lastAutoJumpAt = 0
+local AUTO_JUMP_COOLDOWN = 0.35
 
 -- target cache
 local trackedTargets: {[Instance]: BasePart} = {}
@@ -592,6 +594,20 @@ task.spawn(function()
 	end
 end)
 
+local function requestJump(hum: Humanoid): boolean
+	local now = os.clock()
+	if now - lastAutoJumpAt < AUTO_JUMP_COOLDOWN then
+		return false
+	end
+	if hum.FloorMaterial == Enum.Material.Air then
+		return false
+	end
+	hum.Jump = true
+	hum:ChangeState(Enum.HumanoidStateType.Jumping)
+	lastAutoJumpAt = now
+	return true
+end
+
 
 -- =========================
 -- Anti-stuck systems
@@ -611,24 +627,13 @@ connect(RunService.Heartbeat, function(dt)
 	jumpRayParams.FilterDescendantsInstances = { character :: Model }
 
 	-- Auto Jump
-	if settings.AutoJump and running then
-		if hum 
-			and hrp 
-			and hum.FloorMaterial ~= Enum.Material.Air
-			and hum.MoveDirection.Magnitude > 0.1 then
+	if settings.AutoJump and running and hum.MoveDirection.Magnitude > 0.1 then
+		local moveDir = hum.MoveDirection.Unit
+		local origin = hrp.Position + Vector3.new(0, 2, 0)
+		local result = workspace:Raycast(origin, moveDir * 3.5, jumpRayParams)
 
-			local moveDir = hum.MoveDirection.Unit
-			local origin = hrp.Position + Vector3.new(0, -1, 0)
-
-			local rayParams = RaycastParams.new()
-			rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-			rayParams.FilterDescendantsInstances = {character}
-
-			local result = workspace:Raycast(origin, moveDir * 4, rayParams)
-
-			if result and result.Instance and result.Instance.CanCollide then
-				hum.Jump = true
-			end
+		if result and result.Instance and result.Instance.CanCollide then
+			requestJump(hum)
 		end
 	end
 
@@ -756,24 +761,15 @@ local function movePathfinding(target: BasePart)
 			end
 		end
 
-		-- ✅ AUTOJUMP INTÉGRÉ PROPREMENT
-		if settings.AutoJump then
-			if wp.Action == Enum.PathWaypointAction.Jump then
-				hum.Jump = true
-			else
-				local rayParams = RaycastParams.new()
-				rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-				rayParams.FilterDescendantsInstances = {character}
-
-				local origin = hrp.Position + Vector3.new(0, 2, 0)
-				local dir = (wp.Position - hrp.Position)
-
-				if dir.Magnitude > 0 then
-					dir = dir.Unit * 4
-					local hit = workspace:Raycast(origin, dir, rayParams)
-					if hit and hit.Instance and hit.Instance.CanCollide then
-						hum.Jump = true
-					end
+		-- Sauts requis par le path + auto-jump obstacle
+		if wp.Action == Enum.PathWaypointAction.Jump then
+			requestJump(hum)
+		elseif settings.AutoJump then
+			local dir = (wp.Position - hrp.Position)
+			if dir.Magnitude > 0 then
+				local hit = workspace:Raycast(hrp.Position + Vector3.new(0, 2, 0), dir.Unit * 4, jumpRayParams)
+				if hit and hit.Instance and hit.Instance.CanCollide then
+					requestJump(hum)
 				end
 			end
 		end
