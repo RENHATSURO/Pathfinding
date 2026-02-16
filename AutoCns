@@ -1,0 +1,895 @@
+--!strict
+--[[
+    Advanced Autofarm LocalScript (Client-side)
+    - Modular architecture: UI, target tracking, movement, anti-stuck, stats
+    - Robust to respawn/death
+    - Dynamic target management for "Coin_Server"
+]]
+
+-- =========================
+-- Services
+-- =========================
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local localPlayer = Players.LocalPlayer
+
+-- =========================
+-- Runtime state
+-- =========================
+local character: Model? = nil
+local humanoid: Humanoid? = nil
+local rootPart: BasePart? = nil
+
+local running = false
+local movementMode = "Pathfinding" -- Pathfinding | Direct TP | Tween
+
+local lastPathSuccessTime = os.clock()
+
+
+local settings = {
+	TweenSpeed = 20, -- [5,50]
+	ActionDelay = 0.20, -- [0,3]
+	WalkSpeed = 16, -- [15,20]
+	RefreshTargetDelay = 0.20, -- [0.05,2]
+	AutoJump = false,
+	AutoWalk = false,
+	SecuTP = false,
+}
+local stats = {
+	startTime = os.clock(),
+	deaths = 0,
+	reachedTargets = 0,
+}
+local currentTargetPart: BasePart? = nil
+local pathBlockedConsecutive = 0
+local lastSecuTPAt = 0
+
+-- target cache
+local trackedTargets: {[Instance]: BasePart} = {}
+local cachedTargetParts: {BasePart} = {}
+
+-- cleanup containers
+local connections: {RBXScriptConnection} = {}
+local pathVisualFolder: Folder? = nil
+local activeTween: Tween? = nil
+
+-- =========================
+-- Utility
+-- =========================
+local function connect(signal: RBXScriptSignal, fn)
+	local c = signal:Connect(fn)
+	table.insert(connections, c)
+	return c
+end
+local function disconnectAll()
+	for _, c in ipairs(connections) do
+		if c.Connected then
+			c:Disconnect()
+		end
+	end
+	table.clear(connections)
+end
+
+local function formatClock(sec: number): string
+	local total = math.max(0, math.floor(sec))
+	local h = math.floor(total / 3600)
+	local m = math.floor((total % 3600) / 60)
+	local s = total % 60
+	return string.format("%02d:%02d:%02d", h, m, s)
+end
+local function getTargetPart(inst: Instance): BasePart?
+	if inst:IsA("BasePart") then
+		return inst
+	elseif inst:IsA("Model") then
+		if inst.PrimaryPart then
+			return inst.PrimaryPart
+		end
+		return inst:FindFirstChildWhichIsA("BasePart")
+	end
+	return nil
+end
+local function refreshCachedTargets()
+	local newList = table.create(64)
+	for obj, part in pairs(trackedTargets) do
+		if obj.Parent ~= nil and part.Parent ~= nil then
+			table.insert(newList, part)
+		else
+			trackedTargets[obj] = nil
+		end
+	end
+	cachedTargetParts = newList
+end
+local function isCharacterReady(): boolean
+	return character ~= nil and humanoid ~= nil and rootPart ~= nil and (humanoid :: Humanoid).Health > 0
+end
+local function applyWalkSpeed()
+	if humanoid then
+		humanoid.WalkSpeed = settings.WalkSpeed
+	end
+end
+local function setCharacter(char: Model)
+	character = char
+	humanoid = char:WaitForChild("Humanoid") :: Humanoid
+	rootPart = char:WaitForChild("HumanoidRootPart") :: BasePart
+	applyWalkSpeed()
+end
+-- =========================
+-- Path visualization
+-- =========================
+local function clearPathVisuals()
+	if pathVisualFolder then
+		pathVisualFolder:Destroy()
+		pathVisualFolder = nil
+	end
+end
+
+local function drawPath(points: {PathWaypoint})
+	clearPathVisuals()
+	if movementMode ~= "Pathfinding" then
+		return
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = "AutofarmPathVisual"
+	folder.Parent = workspace
+	pathVisualFolder = folder
+
+	for i = 1, #points - 1 do
+		local a = points[i].Position
+		local b = points[i + 1].Position
+		local dist = (b - a).Magnitude
+
+		local p = Instance.new("Part")
+		p.Anchored = true
+		p.CanCollide = false
+		p.Material = Enum.Material.Neon
+		p.Color = Color3.fromRGB(0, 200, 255)
+		p.Transparency = 0.35
+		p.Size = Vector3.new(0.2, 0.2, dist)
+		p.CFrame = CFrame.lookAt((a + b) * 0.5, b)
+		p.Parent = folder
+	end
+end
+
+-- =========================
+-- GUI
+-- =========================
+local gui = Instance.new("ScreenGui")
+gui.Name = "AdvancedAutofarmUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(430, 350)
+main.Position = UDim2.new(0.05, 0, 0.1, 0)
+main.BackgroundColor3 = Color3.fromRGB(20, 24, 31)
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1, 0, 0, 34)
+topBar.BackgroundColor3 = Color3.fromRGB(31, 37, 48)
+topBar.BorderSizePixel = 0
+topBar.Parent = main
+Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Size = UDim2.new(1, -20, 1, 0)
+title.Position = UDim2.fromOffset(10, 0)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.fromRGB(235, 240, 255)
+title.Text = "Advanced Autofarm"
+title.Parent = topBar
+
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -20, 0, 32)
+tabBar.Position = UDim2.fromOffset(10, 42)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = main
+
+local paramsTabBtn = Instance.new("TextButton")
+paramsTabBtn.Size = UDim2.new(0.5, -5, 1, 0)
+paramsTabBtn.BackgroundColor3 = Color3.fromRGB(54, 88, 155)
+paramsTabBtn.TextColor3 = Color3.new(1, 1, 1)
+paramsTabBtn.Font = Enum.Font.GothamSemibold
+paramsTabBtn.TextSize = 13
+paramsTabBtn.Text = "Paramètres"
+paramsTabBtn.BorderSizePixel = 0
+paramsTabBtn.Parent = tabBar
+Instance.new("UICorner", paramsTabBtn).CornerRadius = UDim.new(0, 8)
+
+local statsTabBtn = Instance.new("TextButton")
+statsTabBtn.Size = UDim2.new(0.5, -5, 1, 0)
+statsTabBtn.Position = UDim2.new(0.5, 5, 0, 0)
+statsTabBtn.BackgroundColor3 = Color3.fromRGB(35, 41, 52)
+statsTabBtn.TextColor3 = Color3.new(1, 1, 1)
+statsTabBtn.Font = Enum.Font.GothamSemibold
+statsTabBtn.TextSize = 13
+statsTabBtn.Text = "Statistiques"
+statsTabBtn.BorderSizePixel = 0
+statsTabBtn.Parent = tabBar
+Instance.new("UICorner", statsTabBtn).CornerRadius = UDim.new(0, 8)
+
+local pages = Instance.new("Frame")
+pages.BackgroundTransparency = 1
+pages.Size = UDim2.new(1, -20, 1, -84)
+pages.Position = UDim2.fromOffset(10, 78)
+pages.Parent = main
+
+local paramsPage = Instance.new("Frame")
+paramsPage.Size = UDim2.fromScale(1, 1)
+paramsPage.BackgroundTransparency = 1
+paramsPage.Parent = pages
+
+local statsPage = Instance.new("Frame")
+statsPage.Size = UDim2.fromScale(1, 1)
+statsPage.BackgroundTransparency = 1
+statsPage.Visible = false
+statsPage.Parent = pages
+
+local function makeSectionLabel(parent: Instance, text: string)
+	local lbl = Instance.new("TextLabel")
+	lbl.BackgroundTransparency = 1
+	lbl.Size = UDim2.new(1, 0, 0, 20)
+	lbl.Font = Enum.Font.GothamBold
+	lbl.TextSize = 12
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.TextColor3 = Color3.fromRGB(190, 210, 255)
+	lbl.Text = text
+	lbl.Parent = parent
+	return lbl
+end
+
+local list = Instance.new("UIListLayout")
+list.Padding = UDim.new(0, 8)
+list.FillDirection = Enum.FillDirection.Vertical
+list.HorizontalAlignment = Enum.HorizontalAlignment.Left
+list.SortOrder = Enum.SortOrder.LayoutOrder
+list.Parent = paramsPage
+
+local function makeButton(parent: Instance, text: string, color: Color3)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 30)
+	b.BackgroundColor3 = color
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamSemibold
+	b.TextSize = 12
+	b.BorderSizePixel = 0
+	b.Text = text
+	b.Parent = parent
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+	return b
+end
+
+local function makeSlider(parent: Instance, titleText: string, minV: number, maxV: number, step: number, defaultV: number, onChange: (number) -> ())
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(1, 0, 0, 48)
+	container.BackgroundTransparency = 1
+	container.Parent = parent
+
+	local titleLabel = Instance.new("TextLabel")
+	titleLabel.Size = UDim2.new(1, 0, 0, 20)
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+	titleLabel.Font = Enum.Font.Gotham
+	titleLabel.TextSize = 12
+	titleLabel.TextColor3 = Color3.fromRGB(225, 230, 240)
+	titleLabel.Parent = container
+
+	local barBg = Instance.new("Frame")
+	barBg.Size = UDim2.new(1, 0, 0, 8)
+	barBg.Position = UDim2.fromOffset(0, 28)
+	barBg.BackgroundColor3 = Color3.fromRGB(43, 49, 63)
+	barBg.BorderSizePixel = 0
+	barBg.Parent = container
+	Instance.new("UICorner", barBg).CornerRadius = UDim.new(1, 0)
+
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.BackgroundColor3 = Color3.fromRGB(75, 145, 255)
+	fill.BorderSizePixel = 0
+	fill.Parent = barBg
+	Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+	local dragging = false
+	local current = defaultV
+
+	local function roundStep(v: number)
+		return math.clamp(math.floor((v / step) + 0.5) * step, minV, maxV)
+	end
+
+	local function refreshText()
+		titleLabel.Text = string.format("%s: %.2f", titleText, current)
+	end
+
+	local function setFromX(x: number)
+		local rel = math.clamp((x - barBg.AbsolutePosition.X) / barBg.AbsoluteSize.X, 0, 1)
+		local raw = minV + (maxV - minV) * rel
+		current = roundStep(raw)
+		local alpha = (current - minV) / (maxV - minV)
+		fill.Size = UDim2.new(alpha, 0, 1, 0)
+		refreshText()
+		onChange(current)
+	end
+
+	refreshText()
+	setFromX(barBg.AbsolutePosition.X + ((defaultV - minV) / (maxV - minV)) * barBg.AbsoluteSize.X)
+
+	connect(barBg.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+
+	connect(UserInputService.InputEnded, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = false
+		end
+	end)
+
+	connect(UserInputService.InputChanged, function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+			setFromX(input.Position.X)
+		end
+	end)
+end
+
+local function makeToggle(parent: Instance, label: string, initial: boolean, onToggle: (boolean) -> ())
+	local btn = makeButton(parent, "", Color3.fromRGB(56, 64, 81))
+
+	local state = initial
+	local function refresh()
+		btn.Text = string.format("%s: %s", label, state and "ON" or "OFF")
+		btn.BackgroundColor3 = state and Color3.fromRGB(55, 145, 95) or Color3.fromRGB(110, 61, 61)
+	end
+
+	connect(btn.MouseButton1Click, function()
+		state = not state
+		refresh()
+		onToggle(state)
+	end)
+
+	refresh()
+	return btn
+end
+makeSectionLabel(paramsPage, "Mode de déplacement (1 actif)")
+local modeRow = Instance.new("Frame")
+modeRow.Size = UDim2.new(1, 0, 0, 30)
+modeRow.BackgroundTransparency = 1
+modeRow.Parent = paramsPage
+
+local modeLayout = Instance.new("UIListLayout")
+modeLayout.FillDirection = Enum.FillDirection.Horizontal
+modeLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+modeLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+modeLayout.Padding = UDim.new(0, 6)
+modeLayout.Parent = modeRow
+
+local pathBtn = makeButton(modeRow, "Pathfinding", Color3.fromRGB(69, 112, 193))
+pathBtn.Size = UDim2.new(0.33, -4, 1, 0)
+local tpBtn = makeButton(modeRow, "Direct TP", Color3.fromRGB(50, 55, 69))
+tpBtn.Size = UDim2.new(0.33, -4, 1, 0)
+local tweenBtn = makeButton(modeRow, "Tween", Color3.fromRGB(50, 55, 69))
+tweenBtn.Size = UDim2.new(0.33, -4, 1, 0)
+
+local function refreshModeButtons()
+	pathBtn.BackgroundColor3 = (movementMode == "Pathfinding") and Color3.fromRGB(69, 112, 193) or Color3.fromRGB(50, 55, 69)
+	tpBtn.BackgroundColor3 = (movementMode == "Direct TP") and Color3.fromRGB(69, 112, 193) or Color3.fromRGB(50, 55, 69)
+	tweenBtn.BackgroundColor3 = (movementMode == "Tween") and Color3.fromRGB(69, 112, 193) or Color3.fromRGB(50, 55, 69)
+end
+connect(pathBtn.MouseButton1Click, function()
+	movementMode = "Pathfinding"
+	refreshModeButtons()
+end)
+connect(tpBtn.MouseButton1Click, function()
+	movementMode = "Direct TP"
+	refreshModeButtons()
+end)
+connect(tweenBtn.MouseButton1Click, function()
+	movementMode = "Tween"
+	refreshModeButtons()
+end)
+makeSlider(paramsPage, "Tween Speed", 5, 50, 1, settings.TweenSpeed, function(v)
+	settings.TweenSpeed = v
+end)
+makeSlider(paramsPage, "Delay avant action", 0, 3, 0.01, settings.ActionDelay, function(v)
+	settings.ActionDelay = v
+end)
+makeSlider(paramsPage, "WalkSpeed joueur", 15, 20, 1, settings.WalkSpeed, function(v)
+	settings.WalkSpeed = v
+	applyWalkSpeed()
+end)
+makeSlider(paramsPage, "Refresh Target Delay", 0.05, 2, 0.01, settings.RefreshTargetDelay, function(v)
+	settings.RefreshTargetDelay = v
+end)
+makeToggle(paramsPage, "Auto Jump", settings.AutoJump, function(v)
+	settings.AutoJump = v
+end)
+makeToggle(paramsPage, "Auto Walk", settings.AutoWalk, function(v)
+	settings.AutoWalk = v
+end)
+makeToggle(paramsPage, "SecuTP", settings.SecuTP, function(v)
+	settings.SecuTP = v
+end)
+local startStopButton = makeButton(paramsPage, "Start Autofarm", Color3.fromRGB(39, 117, 74))
+connect(startStopButton.MouseButton1Click, function()
+	running = not running
+	startStopButton.Text = running and "Stop Autofarm" or "Start Autofarm"
+	startStopButton.BackgroundColor3 = running and Color3.fromRGB(153, 58, 58) or Color3.fromRGB(39, 117, 74)
+	if not running then
+		currentTargetPart = nil
+		clearPathVisuals()
+	end
+end)
+-- stats page
+local statsList = Instance.new("UIListLayout")
+statsList.Padding = UDim.new(0, 10)
+statsList.FillDirection = Enum.FillDirection.Vertical
+statsList.SortOrder = Enum.SortOrder.LayoutOrder
+statsList.Parent = statsPage
+
+makeSectionLabel(statsPage, "Statistiques dynamiques")
+
+local function makeStatLabel(parent: Instance, text: string)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 0, 28)
+	lbl.BackgroundColor3 = Color3.fromRGB(32, 38, 49)
+	lbl.BorderSizePixel = 0
+	lbl.Font = Enum.Font.GothamSemibold
+	lbl.TextSize = 13
+	lbl.TextColor3 = Color3.fromRGB(235, 240, 255)
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.Text = "  " .. text
+	lbl.Parent = parent
+	Instance.new("UICorner", lbl).CornerRadius = UDim.new(0, 8)
+	return lbl
+end
+local elapsedLabel = makeStatLabel(statsPage, "Temps écoulé: 00:00:00")
+local deathLabel = makeStatLabel(statsPage, "Nombre de morts: 0")
+local reachedLabel = makeStatLabel(statsPage, "Cibles atteintes: 0")
+connect(paramsTabBtn.MouseButton1Click, function()
+	paramsPage.Visible = true
+	statsPage.Visible = false
+	paramsTabBtn.BackgroundColor3 = Color3.fromRGB(54, 88, 155)
+	statsTabBtn.BackgroundColor3 = Color3.fromRGB(35, 41, 52)
+end)
+connect(statsTabBtn.MouseButton1Click, function()
+	paramsPage.Visible = false
+	statsPage.Visible = true
+	paramsTabBtn.BackgroundColor3 = Color3.fromRGB(35, 41, 52)
+	statsTabBtn.BackgroundColor3 = Color3.fromRGB(54, 88, 155)
+end)
+-- draggable by top bar only
+local dragging = false
+local dragStart = Vector2.zero
+local frameStart = Vector2.zero
+connect(topBar.InputBegan, function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = true
+		dragStart = input.Position
+		frameStart = main.AbsolutePosition
+	end
+end)
+connect(UserInputService.InputEnded, function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = false
+	end
+end)
+connect(UserInputService.InputChanged, function(input)
+	if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+		local delta = input.Position - dragStart
+		main.Position = UDim2.fromOffset(frameStart.X + delta.X, frameStart.Y + delta.Y)
+	end
+end)
+refreshModeButtons()
+
+-- =========================
+-- Input pause for pathfinding
+-- =========================
+local moveKeys: {[Enum.KeyCode]: boolean} = {
+	[Enum.KeyCode.W] = false,
+	[Enum.KeyCode.A] = false,
+	[Enum.KeyCode.S] = false,
+	[Enum.KeyCode.D] = false,
+	[Enum.KeyCode.Up] = false,
+	[Enum.KeyCode.Down] = false,
+	[Enum.KeyCode.Left] = false,
+	[Enum.KeyCode.Right] = false,
+}
+local function isManualMoving(): boolean
+	for _, v in pairs(moveKeys) do
+		if v then
+			return true
+		end
+	end
+	return false
+end
+connect(UserInputService.InputBegan, function(input, gameProcessed)
+	if gameProcessed then return end
+	if moveKeys[input.KeyCode] ~= nil then
+		moveKeys[input.KeyCode] = true
+	end
+end)
+connect(UserInputService.InputEnded, function(input)
+	if moveKeys[input.KeyCode] ~= nil then
+		moveKeys[input.KeyCode] = false
+	end
+end)
+-- =========================
+-- Character lifecycle (death-safe)
+-- =========================
+local function onCharacterAdded(char: Model)
+	setCharacter(char)
+	local hum = humanoid
+	if hum then
+		connect(hum.Died, function()
+			stats.deaths += 1
+		end)
+	end
+end
+if localPlayer.Character then
+	onCharacterAdded(localPlayer.Character)
+end
+connect(localPlayer.CharacterAdded, onCharacterAdded)
+-- =========================
+-- Process 1: target scanning
+-- =========================
+task.spawn(function()
+	while true do
+		-- full scan (dynamic spawn/despawn support)
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d.Name == "Coin_Server" then
+				local part = getTargetPart(d)
+				if part then
+					trackedTargets[d] = part
+				end
+			end
+		end
+
+		refreshCachedTargets()
+		task.wait(0.7)
+	end
+end)
+-- =========================
+-- Process 2: nearest target selection
+-- =========================
+local function nearestTargetPart(fromPos: Vector3): BasePart?
+	local nearest: BasePart? = nil
+	local bestDist = math.huge
+
+	for _, part in ipairs(cachedTargetParts) do
+		if part.Parent ~= nil then
+			local dist = (part.Position - fromPos).Magnitude
+			if dist < bestDist then
+				bestDist = dist
+				nearest = part
+			end
+		end
+	end
+
+	return nearest
+end
+
+task.spawn(function()
+	while true do
+		if running and isCharacterReady() then
+			local hrp = rootPart :: BasePart
+			currentTargetPart = nearestTargetPart(hrp.Position)
+		else
+			currentTargetPart = nil
+		end
+		task.wait(settings.RefreshTargetDelay)
+	end
+end)
+
+
+-- =========================
+-- Anti-stuck systems
+-- =========================
+local lastPosXZ: Vector2? = nil
+local idleTimer = 0
+local random = Random.new()
+
+local jumpRayParams = RaycastParams.new()
+jumpRayParams.FilterType = Enum.RaycastFilterType.Blacklist
+
+connect(RunService.Heartbeat, function(dt)
+	if not isCharacterReady() then return end
+	local hrp = rootPart :: BasePart
+	local hum = humanoid :: Humanoid
+
+	jumpRayParams.FilterDescendantsInstances = { character :: Model }
+
+	-- Auto Jump
+	if settings.AutoJump and running then
+		if hum 
+			and hrp 
+			and hum.FloorMaterial ~= Enum.Material.Air
+			and hum.MoveDirection.Magnitude > 0.1 then
+
+			local moveDir = hum.MoveDirection.Unit
+			local origin = hrp.Position + Vector3.new(0, -1, 0)
+
+			local rayParams = RaycastParams.new()
+			rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+			rayParams.FilterDescendantsInstances = {character}
+
+			local result = workspace:Raycast(origin, moveDir * 4, rayParams)
+
+			if result and result.Instance and result.Instance.CanCollide then
+				hum.Jump = true
+			end
+		end
+	end
+
+
+
+	-- Auto Walk: idle XZ > 5s
+	if settings.AutoWalk and running and movementMode ~= "Pathfinding" then
+		local currentXZ = Vector2.new(hrp.Position.X, hrp.Position.Z)
+		if lastPosXZ == nil then
+			lastPosXZ = currentXZ
+		end
+
+		if (currentXZ - (lastPosXZ :: Vector2)).Magnitude < 0.12 then
+			idleTimer += dt
+		else
+			idleTimer = 0
+		end
+		lastPosXZ = currentXZ
+
+		if idleTimer >= 5 then
+			idleTimer = 0
+			local angle = random:NextNumber(0, math.pi * 2)
+			local dir = Vector3.new(math.cos(angle), 0, math.sin(angle)).Unit
+			hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir)
+
+			task.spawn(function()
+				local untilT = os.clock() + 2
+				while os.clock() < untilT and running and humanoid and humanoid.Health > 0 do
+					humanoid:Move(dir, false)
+					task.wait(0.1)
+				end
+			end)
+		end
+	else
+		idleTimer = 0
+		lastPosXZ = nil
+	end
+end)
+-- =========================
+-- Movement handlers
+-- =========================
+local function cancelTween()
+	if activeTween then
+		activeTween:Cancel()
+		activeTween = nil
+	end
+end
+local function moveDirectTP(target: BasePart)
+	if not isCharacterReady() then return false, "Character not ready" end
+	cancelTween()
+	local hrp = rootPart :: BasePart
+	hrp.CFrame = CFrame.new(target.Position + Vector3.new(0, 2.5, 0))
+	return true, nil
+end
+
+local function moveTween(target: BasePart)
+	if not isCharacterReady() then return false, "Character not ready" end
+	cancelTween()
+
+	local hrp = rootPart :: BasePart
+	local dist = (target.Position - hrp.Position).Magnitude
+	local time = math.max(0.05, dist / math.max(1, settings.TweenSpeed))
+	local tw = TweenService:Create(hrp, TweenInfo.new(time, Enum.EasingStyle.Linear), {
+		CFrame = CFrame.new(target.Position + Vector3.new(0, 2.5, 0))
+	})
+	activeTween = tw
+	tw:Play()
+	tw.Completed:Wait()
+	if activeTween == tw then
+		activeTween = nil
+	end
+	return true, nil
+end
+local function movePathfinding(target: BasePart)
+	if not isCharacterReady() then return false, "Character not ready" end
+	local hrp = rootPart :: BasePart
+	local hum = humanoid :: Humanoid
+
+	local dist = (target.Position - hrp.Position).Magnitude
+	if dist > 300 then
+		return false, "Target too far"
+	end
+
+	local path = PathfindingService:CreatePath({
+		AgentRadius = 2.5,
+		AgentHeight = 3,
+		AgentCanJump = true,
+		AgentCanClimb = true,
+	})
+
+	local okCompute, err = pcall(function()
+		path:ComputeAsync(hrp.Position, target.Position)
+	end)
+
+	if not okCompute then
+		return false, tostring(err)
+	end
+
+	if path.Status ~= Enum.PathStatus.Success then
+		return false, "No path"
+	end
+
+	local waypoints = path:GetWaypoints()
+	if #waypoints == 0 then
+		return false, "Empty path"
+	end
+
+	drawPath(waypoints)
+
+	for i, wp in ipairs(waypoints) do
+		if not running or movementMode ~= "Pathfinding" then
+			return false, "Interrupted"
+		end
+		if not isCharacterReady() then
+			return false, "Dead"
+		end
+
+		if isManualMoving() then
+			repeat
+				task.wait(0.1)
+			until (not isManualMoving()) or not running or movementMode ~= "Pathfinding"
+
+			if not running or movementMode ~= "Pathfinding" then
+				return false, "Interrupted"
+			end
+		end
+
+		-- ✅ AUTOJUMP INTÉGRÉ PROPREMENT
+		if settings.AutoJump then
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				hum.Jump = true
+			else
+				local rayParams = RaycastParams.new()
+				rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+				rayParams.FilterDescendantsInstances = {character}
+
+				local origin = hrp.Position + Vector3.new(0, 2, 0)
+				local dir = (wp.Position - hrp.Position)
+
+				if dir.Magnitude > 0 then
+					dir = dir.Unit * 4
+					local hit = workspace:Raycast(origin, dir, rayParams)
+					if hit and hit.Instance and hit.Instance.CanCollide then
+						hum.Jump = true
+					end
+				end
+			end
+		end
+
+		-- ✅ MoveTo principal
+		hum:MoveTo(wp.Position)
+
+		local reached = false
+		local finished = false
+
+		local conn
+		conn = hum.MoveToFinished:Connect(function(r)
+			reached = r
+			finished = true
+		end)
+
+		while not finished do
+			if not running or movementMode ~= "Pathfinding" then
+				conn:Disconnect()
+				return false, "Interrupted"
+			end
+
+			if isManualMoving() then
+				hum:Move(Vector3.zero, false)
+				repeat
+					task.wait(0.1)
+				until not isManualMoving() or not running
+				hum:MoveTo(wp.Position)
+			end
+
+			task.wait(0.05)
+		end
+
+		conn:Disconnect()
+
+		if not reached and i < #waypoints then
+			return false, "MoveTo failed"
+		end
+	end
+
+
+	return true, nil
+end
+-- =========================
+-- Process 3: movement controller
+-- =========================
+task.spawn(function()
+	while true do
+		if running and isCharacterReady() then
+			local target = currentTargetPart
+			if target and target.Parent then
+				local success = false
+				local reason = "Unknown"
+
+				if movementMode == "Direct TP" then
+					success, reason = moveDirectTP(target)
+				elseif movementMode == "Tween" then
+					success, reason = moveTween(target)
+				else
+					success, reason = movePathfinding(target)
+				end
+
+				if success then
+					stats.reachedTargets += 1
+					pathBlockedConsecutive = 0
+				else
+					if movementMode == "Pathfinding" and reason ~= "Target too far" then
+						pathBlockedConsecutive += settings.RefreshTargetDelay
+					end
+				end
+
+				-- SecuTP: no path for 10s consecutive + 15s cooldown
+				if settings.SecuTP and movementMode == "Pathfinding" then
+					local now = os.clock()
+					if pathBlockedConsecutive >= 10 and (now - lastSecuTPAt) >= 15 then
+						if #cachedTargetParts > 0 and rootPart then
+							local idx = random:NextInteger(1, #cachedTargetParts)
+							local hrp = rootPart :: BasePart
+							hrp.CFrame = CFrame.new(cachedTargetParts[idx].Position + Vector3.new(0, 2.5, 0))
+							lastSecuTPAt = now
+							pathBlockedConsecutive = 0
+						end
+					end
+				end
+
+				task.wait(settings.ActionDelay)
+			else
+				task.wait(settings.RefreshTargetDelay)
+			end
+		else
+			cancelTween()
+			task.wait(0.15)
+		end
+	end
+end)
+-- =========================
+-- Stats refresh loop
+-- =========================
+task.spawn(function()
+	while true do
+		elapsedLabel.Text = "  Temps écoulé: " .. formatClock(os.clock() - stats.startTime)
+		deathLabel.Text = string.format("  Nombre de morts: %d", stats.deaths)
+		reachedLabel.Text = string.format("  Cibles atteintes: %d", stats.reachedTargets)
+		task.wait(0.2)
+	end
+end)
+-- keep settings applied even if changed externally
+connect(RunService.Stepped, function()
+	if humanoid and humanoid.Health > 0 and math.abs(humanoid.WalkSpeed - settings.WalkSpeed) > 0.01 then
+		humanoid.WalkSpeed = settings.WalkSpeed
+	end
+end)
+-- safety cleanup on script destroy
+gui.Destroying:Connect(function()
+	running = false
+	cancelTween()
+	clearPathVisuals()
+	disconnectAll()
+end)
