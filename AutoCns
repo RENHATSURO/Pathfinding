@@ -58,6 +58,16 @@ local connections: {RBXScriptConnection} = {}
 local pathVisualFolder: Folder? = nil
 local activeTween: Tween? = nil
 
+local pathComputeCooldownUntil = 0
+local cachedPathTarget: BasePart? = nil
+local cachedPathGoalPosition: Vector3? = nil
+local cachedPathWaypoints: {PathWaypoint} = {}
+local PATH_RECOMPUTE_COOLDOWN = 0.25
+local PATH_REUSE_TARGET_RADIUS = 5
+local PATH_NODE_MIN_SPACING = 3
+local PATH_NODE_MAX_TURN_DOT = 0.995
+local MAX_PATH_TARGET_DISTANCE = 300
+
 -- =========================
 -- Utility
 -- =========================
@@ -431,6 +441,9 @@ connect(startStopButton.MouseButton1Click, function()
 	if not running then
 		currentTargetPart = nil
 		clearPathVisuals()
+		cachedPathTarget = nil
+		cachedPathGoalPosition = nil
+		cachedPathWaypoints = {}
 	end
 end)
 -- stats page
@@ -546,18 +559,35 @@ connect(localPlayer.CharacterAdded, onCharacterAdded)
 -- =========================
 -- Process 1: target scanning
 -- =========================
+local function trackTarget(inst: Instance)
+	if inst.Name ~= "Coin_Server" then
+		return
+	end
+	local part = getTargetPart(inst)
+	if part then
+		trackedTargets[inst] = part
+	end
+end
+
+local function untrackTarget(inst: Instance)
+	trackedTargets[inst] = nil
+end
+
+for _, d in ipairs(workspace:GetDescendants()) do
+	trackTarget(d)
+end
+refreshCachedTargets()
+
+connect(workspace.DescendantAdded, function(inst)
+	trackTarget(inst)
+end)
+
+connect(workspace.DescendantRemoving, function(inst)
+	untrackTarget(inst)
+end)
+
 task.spawn(function()
 	while true do
-		-- full scan (dynamic spawn/despawn support)
-		for _, d in ipairs(workspace:GetDescendants()) do
-			if d.Name == "Coin_Server" then
-				local part = getTargetPart(d)
-				if part then
-					trackedTargets[d] = part
-				end
-			end
-		end
-
 		refreshCachedTargets()
 		task.wait(0.7)
 	end
@@ -565,14 +595,14 @@ end)
 -- =========================
 -- Process 2: nearest target selection
 -- =========================
-local function nearestTargetPart(fromPos: Vector3): BasePart?
+local function nearestTargetPart(fromPos: Vector3, maxDistance: number?): BasePart?
 	local nearest: BasePart? = nil
-	local bestDist = math.huge
+	local bestDist = maxDistance or math.huge
 
 	for _, part in ipairs(cachedTargetParts) do
 		if part.Parent ~= nil then
 			local dist = (part.Position - fromPos).Magnitude
-			if dist < bestDist then
+			if dist <= bestDist then
 				bestDist = dist
 				nearest = part
 			end
@@ -586,7 +616,14 @@ task.spawn(function()
 	while true do
 		if running and isCharacterReady() then
 			local hrp = rootPart :: BasePart
-			currentTargetPart = nearestTargetPart(hrp.Position)
+			local previousTarget = currentTargetPart
+			local maxTargetDistance = (movementMode == "Pathfinding") and MAX_PATH_TARGET_DISTANCE or nil
+			currentTargetPart = nearestTargetPart(hrp.Position, maxTargetDistance)
+			if previousTarget ~= currentTargetPart then
+				cachedPathTarget = nil
+				cachedPathGoalPosition = nil
+				cachedPathWaypoints = {}
+			end
 		else
 			currentTargetPart = nil
 		end
@@ -707,38 +744,121 @@ local function moveTween(target: BasePart)
 	end
 	return true, nil
 end
-local function movePathfinding(target: BasePart)
-	if not isCharacterReady() then return false, "Character not ready" end
-	local hrp = rootPart :: BasePart
-	local hum = humanoid :: Humanoid
-
-	local dist = (target.Position - hrp.Position).Magnitude
-	if dist > 300 then
-		return false, "Target too far"
+local function simplifyWaypoints(rawWaypoints: {PathWaypoint}): {PathWaypoint}
+	if #rawWaypoints <= 2 then
+		return rawWaypoints
 	end
+
+	local simplified = table.create(#rawWaypoints)
+	table.insert(simplified, rawWaypoints[1])
+
+	for i = 2, #rawWaypoints - 1 do
+		local prevPos = simplified[#simplified].Position
+		local current = rawWaypoints[i]
+		local nextWp = rawWaypoints[i + 1]
+
+		local toCurrent = current.Position - prevPos
+		local toNext = nextWp.Position - current.Position
+		local spacing = toCurrent.Magnitude
+
+		local shouldKeep = true
+		if spacing < PATH_NODE_MIN_SPACING and current.Action == Enum.PathWaypointAction.Walk then
+			if toCurrent.Magnitude > 0 and toNext.Magnitude > 0 then
+				local turnDot = toCurrent.Unit:Dot(toNext.Unit)
+				if turnDot >= PATH_NODE_MAX_TURN_DOT then
+					shouldKeep = false
+				end
+			end
+		end
+
+		if shouldKeep then
+			table.insert(simplified, current)
+		end
+	end
+
+	table.insert(simplified, rawWaypoints[#rawWaypoints])
+	return simplified
+end
+
+local function shouldReusePath(target: BasePart): boolean
+	if #cachedPathWaypoints == 0 then
+		return false
+	end
+	if cachedPathTarget == nil or cachedPathTarget.Parent == nil then
+		return false
+	end
+	if cachedPathTarget ~= target then
+		return false
+	end
+	return true
+end
+
+local function getPathWaypoints(target: BasePart, hrp: BasePart): ({PathWaypoint}?, string?)
+	if shouldReusePath(target) then
+		return cachedPathWaypoints, nil
+	end
+
+	local now = os.clock()
+	if now < pathComputeCooldownUntil then
+		return nil, "Pathfinding cooling down"
 
 	local path = PathfindingService:CreatePath({
 		AgentRadius = 2.5,
 		AgentHeight = 3,
 		AgentCanJump = true,
 		AgentCanClimb = true,
+		WaypointSpacing = 8,
 	})
 
 	local okCompute, err = pcall(function()
 		path:ComputeAsync(hrp.Position, target.Position)
 	end)
 
+		pathComputeCooldownUntil = now + PATH_RECOMPUTE_COOLDOWN
+
 	if not okCompute then
-		return false, tostring(err)
+			return nil, tostring(err)
 	end
 
 	if path.Status ~= Enum.PathStatus.Success then
-		return false, "No path"
+			return nil, "No path"
+		end
+
+		local computedWaypoints = path:GetWaypoints()
+		if #computedWaypoints == 0 then
+			return nil, "Empty path"
+		end
+
+		local simplified = simplifyWaypoints(computedWaypoints)
+		cachedPathTarget = target
+		cachedPathGoalPosition = target.Position
+		cachedPathWaypoints = simplified
+
+		return simplified, nil
 	end
 
-	local waypoints = path:GetWaypoints()
-	if #waypoints == 0 then
-		return false, "Empty path"
+	local function movePathfinding(target: BasePart)
+		if not isCharacterReady() then return false, "Character not ready" end
+		local hrp = rootPart :: BasePart
+		local hum = humanoid :: Humanoid
+
+		local dist = (target.Position - hrp.Position).Magnitude
+		if dist > MAX_PATH_TARGET_DISTANCE then
+			return false, "Target too far"
+		end
+
+		if cachedPathTarget == target and cachedPathGoalPosition then
+			local targetMoved = (target.Position - cachedPathGoalPosition).Magnitude
+			if targetMoved > PATH_REUSE_TARGET_RADIUS then
+				cachedPathWaypoints = {}
+				cachedPathGoalPosition = nil
+				cachedPathTarget = nil
+			end
+	end
+
+		local waypoints, pathErr = getPathWaypoints(target, hrp)
+		if not waypoints then
+			return false, pathErr or "No path"
 	end
 
 	drawPath(waypoints)
@@ -887,5 +1007,8 @@ gui.Destroying:Connect(function()
 	running = false
 	cancelTween()
 	clearPathVisuals()
+		cachedPathTarget = nil
+		cachedPathGoalPosition = nil
+		cachedPathWaypoints = {}
 	disconnectAll()
 end)
