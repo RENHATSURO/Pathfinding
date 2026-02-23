@@ -801,7 +801,7 @@ local function getPathWaypoints(target: BasePart, hrp: BasePart): ({PathWaypoint
 	local now = os.clock()
 	if now < pathComputeCooldownUntil then
 		return nil, "Pathfinding cooling down"
-
+end
 	local path = PathfindingService:CreatePath({
 		AgentRadius = 2.5,
 		AgentHeight = 3,
